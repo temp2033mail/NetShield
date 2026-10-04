@@ -1,0 +1,7 @@
+{
+  "name": "NetShield",
+  "description": "Real-time network traffic monitor, malicious domain blocker, per-app Wi-Fi/cellular firewall, and cybersecurity reports.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
+

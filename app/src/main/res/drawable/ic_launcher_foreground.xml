@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <group
+        android:pivotX="54"
+        android:pivotY="54">
+        <!-- Shield Outer Glow / Outline -->
+        <path
+            android:fillColor="#1500F5D4"
+            android:strokeColor="#00F5D4"
+            android:strokeWidth="2.5"
+            android:pathData="M54,26 L76,34 C76,56 66,72 54,82 C42,72 32,56 32,34 Z" />
+
+        <!-- Shield Inner Core -->
+        <path
+            android:fillColor="#250077B6"
+            android:strokeColor="#90E0EF"
+            android:strokeWidth="1.2"
+            android:pathData="M54,32 L70,38 C70,54 62,66 54,74 C46,66 38,54 38,38 Z" />
+
+        <!-- Firewall / Lock Motif -->
+        <path
+            android:fillColor="#00F5D4"
+            android:pathData="M51,46 C51,44.3 52.3,43 54,43 C55.7,43 57,44.3 57,46 L57,49 L51,49 Z" />
+        <path
+            android:fillColor="#FFFFFF"
+            android:pathData="M48,49 L60,49 C61.1,49 62,49.9 62,51 L62,60 C62,61.1 61.1,62 60,62 L48,62 C46.9,62 46,61.1 46,60 L46,51 C46,49.9 46.9,49 48,49 Z" />
+        <path
+            android:fillColor="#0A1128"
+            android:pathData="M54,53 C53.2,53 52.5,53.7 52.5,54.5 C52.5,55.1 52.9,55.6 53.4,55.9 L53,58.5 L55,58.5 L54.6,55.9 C55.1,55.6 55.5,55.1 55.5,54.5 C55.5,53.7 54.8,53 54,53 Z" />
+
+        <!-- Network Nodes / Pulse Signal Rays -->
+        <path
+            android:strokeColor="#00F5D4"
+            android:strokeWidth="1.8"
+            android:pathData="M54,66 L54,72" />
+        <path
+            android:strokeColor="#00F5D4"
+            android:strokeWidth="1.8"
+            android:pathData="M44,56 L38,56" />
+        <path
+            android:strokeColor="#00F5D4"
+            android:strokeWidth="1.8"
+            android:pathData="M64,56 L70,56" />
+        <path
+            android:fillColor="#00F5D4"
+            android:pathData="M37,56 m-1.8,0 a1.8,1.8 0 1,0 3.6,0 a1.8,1.8 0 1,0 -3.6,0" />
+        <path
+            android:fillColor="#00F5D4"
+            android:pathData="M71,56 m-1.8,0 a1.8,1.8 0 1,0 3.6,0 a1.8,1.8 0 1,0 -3.6,0" />
+    </group>
+</vector>
