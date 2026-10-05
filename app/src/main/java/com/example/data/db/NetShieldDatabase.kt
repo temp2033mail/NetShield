@@ -31,7 +31,7 @@ abstract class NetShieldDatabase : RoomDatabase() {
                     context.applicationContext,
                     NetShieldDatabase::class.java,
                     "netshield_secure.db"
-                ).fallbackToDestructiveMigration()
+                ).fallbackToDestructiveMigration(dropAllTables = true)
                     .build()
                 INSTANCE = instance
                 instance
