@@ -143,7 +143,74 @@ fun DashboardScreen(
             onToggle = onToggleProtection
         )
 
-        Spacer(modifier = Modifier.height(16.dp))
+        Spacer(modifier = Modifier.height(12.dp))
+
+        if (!uiState.isVpnActive) {
+            Card(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(vertical = 2.dp),
+                shape = RoundedCornerShape(12.dp),
+                colors = CardDefaults.cardColors(containerColor = ThreatRed.copy(alpha = 0.15f)),
+                border = CardDefaults.outlinedCardBorder().copy(brush = Brush.linearGradient(listOf(ThreatRed, AlertOrange)))
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(12.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "VPN Sentinel Disconnected",
+                            style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.Bold),
+                            color = ThreatRed
+                        )
+                        Text(
+                            text = "Enable protection to intercept DNS & block restricted apps in real time.",
+                            style = MaterialTheme.typography.bodySmall.copy(fontSize = 11.sp),
+                            color = TextSecondary
+                        )
+                    }
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Button(
+                        onClick = onToggleProtection,
+                        colors = ButtonDefaults.buttonColors(containerColor = ThreatRed),
+                        shape = RoundedCornerShape(8.dp),
+                        modifier = Modifier.testTag("enable_protection_banner_button")
+                    ) {
+                        Text("Start VPN", fontSize = 12.sp, color = Color.White)
+                    }
+                }
+            }
+            Spacer(modifier = Modifier.height(10.dp))
+        } else {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(ShieldGreen.copy(alpha = 0.12f))
+                    .border(1.dp, ShieldGreen.copy(alpha = 0.4f), RoundedCornerShape(8.dp))
+                    .padding(horizontal = 12.dp, vertical = 6.dp)
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(
+                        imageVector = Icons.Default.Security,
+                        contentDescription = null,
+                        tint = ShieldGreen,
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(
+                        text = "Sentinel Active • Live DNS Interception & App Firewall Running",
+                        style = MaterialTheme.typography.bodySmall.copy(fontSize = 11.sp, fontWeight = FontWeight.SemiBold),
+                        color = ShieldGreen
+                    )
+                }
+            }
+            Spacer(modifier = Modifier.height(10.dp))
+        }
 
         // Real-Time Bandwidth Speedometer & Live Throughput Card
         Card(

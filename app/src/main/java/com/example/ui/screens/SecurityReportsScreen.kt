@@ -284,6 +284,11 @@ fun SecurityReportsScreen(
                     count = report.threatCategoryCounts[ThreatCategory.TELEMETRY.name] ?: 0,
                     color = Color(0xFFB388FF)
                 )
+                ThreatCategoryItem(
+                    title = "App Firewall Blocks",
+                    count = report.threatCategoryCounts[ThreatCategory.APP_FIREWALL.name] ?: 0,
+                    color = AlertOrange
+                )
             }
         }
 

@@ -12,6 +12,7 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
+import com.example.vpn.NetShieldVpnService
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.WindowInsets
@@ -82,6 +83,9 @@ class MainActivity : ComponentActivity() {
                 LaunchedEffect(Unit) {
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                         notificationLauncher.launch(android.Manifest.permission.POST_NOTIFICATIONS)
+                    }
+                    if (VpnService.prepare(this@MainActivity) == null && !NetShieldVpnService.isVpnActive.value) {
+                        viewModel.startVpnService()
                     }
                 }
 

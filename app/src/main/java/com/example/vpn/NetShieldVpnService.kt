@@ -11,10 +11,12 @@ import android.net.NetworkCapabilities
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
+import android.system.OsConstants
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import com.example.MainActivity
 import com.example.data.db.NetShieldDatabase
+import com.example.data.model.AppFirewallRule
 import com.example.data.model.NetworkLogEntity
 import com.example.data.model.ThreatCategory
 import com.example.data.model.ThreatLevel
@@ -24,22 +26,32 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.net.DatagramPacket
 import java.net.DatagramSocket
+import java.net.Inet4Address
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.nio.ByteBuffer
+import java.util.concurrent.ConcurrentHashMap
 
 class NetShieldVpnService : VpnService() {
 
     private var vpnInterface: ParcelFileDescriptor? = null
     private val serviceScope = CoroutineScope(Dispatchers.IO + Job())
     private var workerJob: Job? = null
+    private var rulesCollectorJob: Job? = null
+
+    // In-memory cache of firewall rules for zero-latency packet filtering
+    private val activeFirewallRules = ConcurrentHashMap<String, AppFirewallRule>()
+
+    // Upstream DNS socket protected from VPN routing
+    private var upstreamDnsSocket: DatagramSocket? = null
+    private val primaryDns = InetSocketAddress("1.1.1.1", 53)
+    private val secondaryDns = InetSocketAddress("8.8.8.8", 53)
 
     companion object {
         const val ACTION_START = "com.example.vpn.START"
@@ -103,41 +115,61 @@ class NetShieldVpnService : VpnService() {
                 val database = NetShieldDatabase.getInstance(applicationContext)
                 val dao = database.netShieldDao()
 
-                // Check active network type (Wi-Fi vs Cellular)
-                val isWifi = isCurrentNetworkWifi()
-
-                // Fetch firewall rules to block applications from this network
-                val allRules = dao.getAllFirewallRules().first()
-                val disallowedPackages = mutableSetOf<String>()
-
-                for (rule in allRules) {
-                    if (isWifi && rule.blockWifi) {
-                        disallowedPackages.add(rule.packageName)
-                    } else if (!isWifi && rule.blockCellular) {
-                        disallowedPackages.add(rule.packageName)
+                // Collect latest firewall rules in background continuously
+                rulesCollectorJob?.cancel()
+                rulesCollectorJob = launch {
+                    dao.getAllFirewallRules().collect { rulesList ->
+                        activeFirewallRules.clear()
+                        for (rule in rulesList) {
+                            activeFirewallRules[rule.packageName] = rule
+                        }
                     }
+                }
+
+                // Initialize protected upstream DNS socket
+                try {
+                    upstreamDnsSocket?.close()
+                    val socket = DatagramSocket()
+                    protect(socket) // CRITICAL: socket traffic bypasses VPN interface
+                    socket.soTimeout = 2500
+                    upstreamDnsSocket = socket
+                } catch (e: Exception) {
+                    Log.e("NetShieldVPN", "Failed to create upstream socket", e)
                 }
 
                 val builder = Builder()
-                    .setSession("NetShield Secure Firewall")
+                    .setSession("NetShield Sentinel")
+                    .setMtu(1500)
+                    // Set local VPN IP
                     .addAddress("10.200.1.1", 32)
-                    .addDnsServer("1.1.1.1") // Secure upstream DNS
-                    .addRoute("10.200.1.0", 24)
+                    // Intercept system DNS by pointing DNS server to our VPN interface
+                    .addDnsServer("10.200.1.1")
+                    // Route DNS traffic through TUN
+                    .addRoute("10.200.1.1", 32)
+                    // Intercept common hardcoded public DNS servers (8.8.8.8, 1.1.1.1, etc.)
+                    .addRoute("1.1.1.1", 32)
+                    .addRoute("1.0.0.1", 32)
+                    .addRoute("8.8.8.8", 32)
+                    .addRoute("8.8.4.4", 32)
+                    .addRoute("9.9.9.9", 32)
+                    .addRoute("208.67.222.222", 32)
 
-                // Configure per-app network blocking via disallowed applications
-                for (pkg in disallowedPackages) {
-                    try {
-                        builder.addDisallowedApplication(pkg)
-                    } catch (e: Exception) {
-                        Log.w("NetShieldVPN", "Cannot disallow package $pkg: ${e.message}")
-                    }
+                // Configure IPv6 addresses and routes
+                try {
+                    builder.addAddress("fd00:1:fd00:1::1", 128)
+                    builder.addDnsServer("fd00:1:fd00:1::1")
+                    builder.addRoute("fd00:1:fd00:1::1", 128)
+                    builder.addRoute("2606:4700:4700::1111", 128)
+                    builder.addRoute("2001:4860:4860::8888", 128)
+                } catch (e: Exception) {
+                    Log.w("NetShieldVPN", "IPv6 not supported: ${e.message}")
                 }
 
-                // Exclude ourselves so we can route DNS lookups
+                // Disallow ONLY NetShield itself so our upstream DNS forwarder doesn't loop into the VPN
                 try {
                     builder.addDisallowedApplication(packageName)
                 } catch (e: Exception) {
-                    // Ignore
+                    Log.w("NetShieldVPN", "Cannot disallow self: ${e.message}")
                 }
 
                 vpnInterface = builder.establish()
@@ -177,106 +209,32 @@ class NetShieldVpnService : VpnService() {
                     packet.limit(length)
                     packet.position(0)
 
-                    val networkType = if (isCurrentNetworkWifi()) "WIFI" else "CELLULAR"
+                    val isWifi = isCurrentNetworkWifi()
+                    val networkType = if (isWifi) "WIFI" else "CELLULAR"
 
-                    // Inspect IPv4 Packet
+                    // Check if IPv4 packet
                     if (packet.remaining() > 20) {
                         val versionAndIHL = packet.get(0).toInt() and 0xFF
                         val ipVersion = versionAndIHL shr 4
-                        val ihl = (versionAndIHL and 0x0F) * 4
 
-                        if (ipVersion == 4 && packet.remaining() >= ihl + 8) {
-                            val protocol = packet.get(9).toInt() and 0xFF // 17 = UDP
-
-                            if (protocol == 17) { // UDP
-                                val srcPort = packet.getShort(ihl).toInt() and 0xFFFF
-                                val destPort = packet.getShort(ihl + 2).toInt() and 0xFFFF
-
-                                if (destPort == 53) { // DNS Query
-                                    _queriesSessionCount.value += 1
-                                    val udpHeaderLen = 8
-                                    val dnsPayloadOffset = ihl + udpHeaderLen
-                                    val dnsPayloadLen = length - dnsPayloadOffset
-
-                                    if (dnsPayloadLen > 12) {
-                                        val dnsPayload = ByteArray(dnsPayloadLen)
-                                        System.arraycopy(packet.array(), dnsPayloadOffset, dnsPayload, 0, dnsPayloadLen)
-
-                                        val domain = DnsPacketHandler.extractDomainName(dnsPayload)
-                                        if (domain != null) {
-                                            // Check custom blacklist/whitelist rules first
-                                            val customRule = dao.getCustomDomainRule(domain)
-                                            val isCustomBlocked = customRule?.isBlocked == true
-                                            val isCustomWhitelisted = customRule != null && !customRule.isBlocked
-
-                                            val threatResult = if (isCustomWhitelisted) {
-                                                null
-                                            } else if (isCustomBlocked) {
-                                                ThreatIntelligence.checkDomain(domain).copy(
-                                                    isThreat = true,
-                                                    category = ThreatCategory.CUSTOM_BLOCKED,
-                                                    reason = "Blocked by custom user blacklist rule"
-                                                )
-                                            } else {
-                                                val check = ThreatIntelligence.checkDomain(domain)
-                                                if (check.isThreat) check else null
-                                            }
-
-                                            if (threatResult != null && threatResult.isThreat) {
-                                                // MALICIOUS DOMAIN DETECTED -> BLOCK IMMEDIATELY
-                                                _blockedThreatsSessionCount.value += 1
-
-                                                // Record in database
-                                                dao.insertLog(
-                                                    NetworkLogEntity(
-                                                        domain = domain,
-                                                        ipAddress = "0.0.0.0 (Blocked)",
-                                                        appName = "Threat Sentinel",
-                                                        packageName = "netshield.filter",
-                                                        protocol = "DNS",
-                                                        networkType = networkType,
-                                                        bytesTransferred = length.toLong(),
-                                                        isBlocked = true,
-                                                        blockReason = threatResult.reason,
-                                                        threatCategory = threatResult.category.name,
-                                                        threatLevel = threatResult.level.name
-                                                    )
-                                                )
-                                                updateNotification()
-
-                                                // Build synthetic response packet with 0.0.0.0 / NXDOMAIN
-                                                val syntheticDnsResponse = DnsPacketHandler.createBlackholeResponse(dnsPayload, dnsPayloadLen)
-                                                val responseIpPacket = createUdpIpResponse(
-                                                    requestPacket = packet.array(),
-                                                    ihl = ihl,
-                                                    udpPayload = syntheticDnsResponse
-                                                )
-                                                outputStream.write(responseIpPacket)
-                                                outputStream.flush()
-                                                packet.clear()
-                                                continue
-                                            } else {
-                                                // Safe / Verified Domain
-                                                dao.insertLog(
-                                                    NetworkLogEntity(
-                                                        domain = domain,
-                                                        ipAddress = "Resolved via 1.1.1.1",
-                                                        appName = "Network Client",
-                                                        packageName = "android.system",
-                                                        protocol = "DNS",
-                                                        networkType = networkType,
-                                                        bytesTransferred = length.toLong(),
-                                                        isBlocked = false,
-                                                        blockReason = "Passed all security filters",
-                                                        threatCategory = ThreatCategory.NONE.name,
-                                                        threatLevel = ThreatLevel.SAFE.name
-                                                    )
-                                                )
-                                            }
-                                        }
-                                    }
-                                }
-                            }
+                        if (ipVersion == 4) {
+                            handleIpv4Packet(
+                                packet = packet,
+                                length = length,
+                                isWifi = isWifi,
+                                networkType = networkType,
+                                dao = dao,
+                                outputStream = outputStream
+                            )
+                        } else if (ipVersion == 6 && packet.remaining() >= 48) {
+                            handleIpv6Packet(
+                                packet = packet,
+                                length = length,
+                                isWifi = isWifi,
+                                networkType = networkType,
+                                dao = dao,
+                                outputStream = outputStream
+                            )
                         }
                     }
 
@@ -284,6 +242,329 @@ class NetShieldVpnService : VpnService() {
                 }
             } catch (e: Exception) {
                 if (!_isVpnActive.value) break
+            }
+        }
+    }
+
+    private suspend fun handleIpv4Packet(
+        packet: ByteBuffer,
+        length: Int,
+        isWifi: Boolean,
+        networkType: String,
+        dao: com.example.data.db.NetShieldDao,
+        outputStream: FileOutputStream
+    ) {
+        val versionAndIHL = packet.get(0).toInt() and 0xFF
+        val ihl = (versionAndIHL and 0x0F) * 4
+
+        if (packet.remaining() < ihl + 8) return
+        val protocol = packet.get(9).toInt() and 0xFF // 17 = UDP
+
+        if (protocol == 17) {
+            val srcPort = packet.getShort(ihl).toInt() and 0xFFFF
+            val destPort = packet.getShort(ihl + 2).toInt() and 0xFFFF
+
+            if (destPort == 53) { // DNS Query Intercepted!
+                _queriesSessionCount.value += 1
+                val udpHeaderLen = 8
+                val dnsPayloadOffset = ihl + udpHeaderLen
+                val dnsPayloadLen = length - dnsPayloadOffset
+
+                if (dnsPayloadLen > 12) {
+                    val dnsPayload = ByteArray(dnsPayloadLen)
+                    System.arraycopy(packet.array(), dnsPayloadOffset, dnsPayload, 0, dnsPayloadLen)
+
+                    val domain = DnsPacketHandler.extractDomainName(dnsPayload)
+                    if (domain != null) {
+                        val srcIpBytes = ByteArray(4)
+                        val dstIpBytes = ByteArray(4)
+                        System.arraycopy(packet.array(), 12, srcIpBytes, 0, 4)
+                        System.arraycopy(packet.array(), 16, dstIpBytes, 0, 4)
+
+                        // 1. Identify requesting application (PCAPdroid UID resolution)
+                        val (appPackage, appLabel) = resolveAppForConnection(
+                            protocol = OsConstants.IPPROTO_UDP,
+                            srcIpBytes = srcIpBytes,
+                            srcPort = srcPort,
+                            dstIpBytes = dstIpBytes,
+                            dstPort = destPort
+                        )
+
+                        // 2. Check per-app Wi-Fi and Cellular Firewall Rules
+                        val appRule = activeFirewallRules[appPackage] ?: dao.getRuleForPackage(appPackage)
+                        val isAppBlockedByFirewall = if (isWifi) {
+                            appRule?.blockWifi == true
+                        } else {
+                            appRule?.blockCellular == true
+                        }
+
+                        if (isAppBlockedByFirewall) {
+                            // APP FIREWALL BLOCK TRIGGERED
+                            _blockedThreatsSessionCount.value += 1
+                            val reason = if (isWifi) {
+                                "$appLabel is blocked from accessing Wi-Fi networks"
+                            } else {
+                                "$appLabel is blocked from accessing Cellular data networks"
+                            }
+
+                            dao.insertLog(
+                                NetworkLogEntity(
+                                    domain = domain,
+                                    ipAddress = "Blocked by App Firewall",
+                                    appName = appLabel,
+                                    packageName = appPackage,
+                                    protocol = "DNS",
+                                    networkType = networkType,
+                                    bytesTransferred = length.toLong(),
+                                    isBlocked = true,
+                                    blockReason = reason,
+                                    threatCategory = ThreatCategory.APP_FIREWALL.name,
+                                    threatLevel = ThreatLevel.HIGH.name
+                                )
+                            )
+                            updateNotification()
+
+                            // Return immediate NXDOMAIN response to stop connection
+                            val nxDomainResponse = DnsPacketHandler.createNxDomainResponse(dnsPayload, dnsPayloadLen)
+                            val responseIpPacket = createUdpIpResponse(
+                                requestPacket = packet.array(),
+                                ihl = ihl,
+                                udpPayload = nxDomainResponse
+                            )
+                            outputStream.write(responseIpPacket)
+                            outputStream.flush()
+                            return
+                        }
+
+                        // 3. Check Malicious Domain Intelligence & User Custom Rules
+                        val customRule = dao.getCustomDomainRule(domain)
+                        val isCustomWhitelisted = customRule != null && !customRule.isBlocked
+                        val isCustomBlocked = customRule?.isBlocked == true
+
+                        val threatResult = if (isCustomWhitelisted) {
+                            null
+                        } else if (isCustomBlocked) {
+                            ThreatIntelligence.checkDomain(domain).copy(
+                                isThreat = true,
+                                category = ThreatCategory.CUSTOM_BLOCKED,
+                                reason = "Blocked by user custom domain blacklist"
+                            )
+                        } else {
+                            val check = ThreatIntelligence.checkDomain(domain)
+                            if (check.isThreat) check else null
+                        }
+
+                        if (threatResult != null && threatResult.isThreat) {
+                            // MALICIOUS DOMAIN DETECTED -> BLOCK IMMEDIATELY
+                            _blockedThreatsSessionCount.value += 1
+
+                            dao.insertLog(
+                                NetworkLogEntity(
+                                    domain = domain,
+                                    ipAddress = "0.0.0.0 (Intercepted)",
+                                    appName = appLabel,
+                                    packageName = appPackage,
+                                    protocol = "DNS",
+                                    networkType = networkType,
+                                    bytesTransferred = length.toLong(),
+                                    isBlocked = true,
+                                    blockReason = threatResult.reason,
+                                    threatCategory = threatResult.category.name,
+                                    threatLevel = threatResult.level.name
+                                )
+                            )
+                            updateNotification()
+
+                            // Synthesize Blackhole / NXDOMAIN response
+                            val blackholeDnsResponse = DnsPacketHandler.createBlackholeResponse(dnsPayload, dnsPayloadLen)
+                            val responseIpPacket = createUdpIpResponse(
+                                requestPacket = packet.array(),
+                                ihl = ihl,
+                                udpPayload = blackholeDnsResponse
+                            )
+                            outputStream.write(responseIpPacket)
+                            outputStream.flush()
+                            return
+                        }
+
+                        // 4. CLEAN & ALLOWED QUERY -> FORWARD TO UPSTREAM DNS
+                        val upstreamResponse = forwardDnsQueryUpstream(dnsPayload)
+                        if (upstreamResponse != null) {
+                            val resolvedIp = DnsPacketHandler.extractResolvedIp(upstreamResponse) ?: "Resolved"
+
+                            dao.insertLog(
+                                NetworkLogEntity(
+                                    domain = domain,
+                                    ipAddress = resolvedIp,
+                                    appName = appLabel,
+                                    packageName = appPackage,
+                                    protocol = "DNS",
+                                    networkType = networkType,
+                                    bytesTransferred = length.toLong(),
+                                    isBlocked = false,
+                                    blockReason = "Verified safe connection",
+                                    threatCategory = ThreatCategory.NONE.name,
+                                    threatLevel = ThreatLevel.SAFE.name
+                                )
+                            )
+
+                            // Wrap and return the real DNS response to the calling application
+                            val responseIpPacket = createUdpIpResponse(
+                                requestPacket = packet.array(),
+                                ihl = ihl,
+                                udpPayload = upstreamResponse
+                            )
+                            outputStream.write(responseIpPacket)
+                            outputStream.flush()
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private suspend fun handleIpv6Packet(
+        packet: ByteBuffer,
+        length: Int,
+        isWifi: Boolean,
+        networkType: String,
+        dao: com.example.data.db.NetShieldDao,
+        outputStream: FileOutputStream
+    ) {
+        val nextHeader = packet.get(6).toInt() and 0xFF
+        if (nextHeader == 17) { // UDP
+            val headerLen = 40
+            val srcPort = packet.getShort(headerLen).toInt() and 0xFFFF
+            val destPort = packet.getShort(headerLen + 2).toInt() and 0xFFFF
+
+            if (destPort == 53) {
+                _queriesSessionCount.value += 1
+                val udpHeaderLen = 8
+                val dnsPayloadOffset = headerLen + udpHeaderLen
+                val dnsPayloadLen = length - dnsPayloadOffset
+
+                if (dnsPayloadLen > 12) {
+                    val dnsPayload = ByteArray(dnsPayloadLen)
+                    System.arraycopy(packet.array(), dnsPayloadOffset, dnsPayload, 0, dnsPayloadLen)
+
+                    val domain = DnsPacketHandler.extractDomainName(dnsPayload)
+                    if (domain != null) {
+                        val check = ThreatIntelligence.checkDomain(domain)
+                        if (check.isThreat) {
+                            _blockedThreatsSessionCount.value += 1
+                            dao.insertLog(
+                                NetworkLogEntity(
+                                    domain = domain,
+                                    ipAddress = ":: (Blocked IPv6)",
+                                    appName = "Network Client",
+                                    packageName = "android",
+                                    protocol = "DNS (IPv6)",
+                                    networkType = networkType,
+                                    bytesTransferred = length.toLong(),
+                                    isBlocked = true,
+                                    blockReason = check.reason,
+                                    threatCategory = check.category.name,
+                                    threatLevel = check.level.name
+                                )
+                            )
+                            updateNotification()
+                        } else {
+                            dao.insertLog(
+                                NetworkLogEntity(
+                                    domain = domain,
+                                    ipAddress = "Resolved IPv6",
+                                    appName = "Network Client",
+                                    packageName = "android",
+                                    protocol = "DNS (IPv6)",
+                                    networkType = networkType,
+                                    bytesTransferred = length.toLong(),
+                                    isBlocked = false,
+                                    blockReason = "Verified safe connection",
+                                    threatCategory = ThreatCategory.NONE.name,
+                                    threatLevel = ThreatLevel.SAFE.name
+                                )
+                            )
+                            forwardDnsQueryUpstream(dnsPayload)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Resolves the calling application package and label using connection owner UID (Android 10+).
+     */
+    private fun resolveAppForConnection(
+        protocol: Int,
+        srcIpBytes: ByteArray,
+        srcPort: Int,
+        dstIpBytes: ByteArray,
+        dstPort: Int
+    ): Pair<String, String> {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            try {
+                val cm = getSystemService(ConnectivityManager::class.java)
+                val srcAddress = InetAddress.getByAddress(srcIpBytes)
+                val dstAddress = InetAddress.getByAddress(dstIpBytes)
+                val uid = cm.getConnectionOwnerUid(
+                    protocol,
+                    InetSocketAddress(srcAddress, srcPort),
+                    InetSocketAddress(dstAddress, dstPort)
+                )
+
+                if (uid > 0) {
+                    val packages = packageManager.getPackagesForUid(uid)
+                    if (!packages.isNullOrEmpty()) {
+                        val pkg = packages[0]
+                        val appName = try {
+                            val appInfo = packageManager.getApplicationInfo(pkg, 0)
+                            packageManager.getApplicationLabel(appInfo).toString()
+                        } catch (e: Exception) {
+                            pkg
+                        }
+                        return Pair(pkg, appName)
+                    }
+                }
+            } catch (e: Exception) {
+                // Fallback
+            }
+        }
+
+        return Pair("android", "Android System")
+    }
+
+    /**
+     * Forwards a DNS query to upstream public DNS server via a protected socket.
+     */
+    private fun forwardDnsQueryUpstream(queryPayload: ByteArray): ByteArray? {
+        val socket = upstreamDnsSocket ?: return null
+        return try {
+            val sendPacket = DatagramPacket(queryPayload, queryPayload.size, primaryDns)
+            socket.send(sendPacket)
+
+            val receiveBuffer = ByteArray(2048)
+            val receivePacket = DatagramPacket(receiveBuffer, receiveBuffer.size)
+            socket.receive(receivePacket)
+
+            val result = ByteArray(receivePacket.length)
+            System.arraycopy(receiveBuffer, 0, result, 0, receivePacket.length)
+            result
+        } catch (e: Exception) {
+            // Retry with secondary DNS
+            try {
+                val sendPacket = DatagramPacket(queryPayload, queryPayload.size, secondaryDns)
+                socket.send(sendPacket)
+
+                val receiveBuffer = ByteArray(2048)
+                val receivePacket = DatagramPacket(receiveBuffer, receiveBuffer.size)
+                socket.receive(receivePacket)
+
+                val result = ByteArray(receivePacket.length)
+                System.arraycopy(receiveBuffer, 0, result, 0, receivePacket.length)
+                result
+            } catch (e2: Exception) {
+                null
             }
         }
     }
@@ -323,7 +604,7 @@ class NetShieldVpnService : VpnService() {
         response[ihl + 6] = 0 // Checksum optional in IPv4 UDP
         response[ihl + 7] = 0
 
-        // Copy payload
+        // Copy DNS payload
         System.arraycopy(udpPayload, 0, response, ihl + 8, udpPayload.size)
 
         // Calculate IPv4 Header Checksum
@@ -352,6 +633,13 @@ class NetShieldVpnService : VpnService() {
     private fun stopVpn() {
         _isVpnActive.value = false
         workerJob?.cancel()
+        rulesCollectorJob?.cancel()
+        try {
+            upstreamDnsSocket?.close()
+        } catch (e: Exception) {
+            // Ignore
+        }
+        upstreamDnsSocket = null
         try {
             vpnInterface?.close()
         } catch (e: Exception) {
